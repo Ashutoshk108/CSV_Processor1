@@ -1,0 +1,109 @@
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends, HTTPException, Form
+from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from app.tasks import process_images
+from app.models import Product, Base, get_db
+from app.validate import validate_csv
+import cloudinary
+import cloudinary.uploader
+import csv
+import uuid
+import os
+from dotenv import load_dotenv
+import logging
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+# if not SQLALCHEMY_DATABASE_URL:
+#     logger.error("DATABASE_URL is not set in the environment variables.")
+#     raise ValueError("DATABASE_URL is not set")
+
+# engine = create_engine(SQLALCHEMY_DATABASE_URL)
+# SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Base = declarative_base()
+
+# def get_db():
+#     db = SessionLocal()
+#     try:
+#         yield db
+#     finally:
+#         db.close()
+
+app = FastAPI()
+
+REDIS_URL = os.getenv("REDIS_URL")
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
+@app.get("/")
+async def read_root():
+    return {"message": "Hello World"}
+
+@app.post("/upload/")
+async def upload_csv(background_tasks: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(get_db), webhook_url: str = Form("")):
+    
+    contents = await file.read()
+    validate_csv(contents.decode())
+    csv_data = csv.reader(contents.decode().splitlines())
+    next(csv_data)  # Skip header
+    
+    try:
+        request_id = str(uuid.uuid4())
+        for row in csv_data:
+            try:
+                serial_number, product_name, input_image_urls = row
+                input_image_urls_list = input_image_urls.split(',')
+                product = Product(
+                    serial_number=serial_number,
+                    product_name=product_name,
+                    input_image_urls=input_image_urls_list,
+                    request_id=request_id
+                )
+                db.add(product)
+            except ValueError as e:
+                logger.error(f"Error processing row {row}: {e}")
+                raise HTTPException(status_code=400, detail="Invalid CSV format")
+        db.commit()
+        
+        process_images.delay(request_id, webhook_url)
+        return {"request_id": request_id}
+    except Exception as e:
+        print(f"Error processing CSV: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/status/{request_id}")
+def check_status(request_id: str, db: Session = Depends(get_db)):
+    product = db.query(Product).filter(Product.request_id == request_id).all()
+    output_image_record = []
+    processed=True
+    for p in product:
+        prod={}
+        prod["serial_number"]=p.serial_number
+        prod["product_name"]=p.product_name
+        prod["output_image_urls"]=p.output_image_urls
+        output_image_record.append(prod)
+        if processed and p.processed==False:
+            print("Product not")
+            processed = False
+
+    if product:
+        return {"processed": processed, "output": output_image_record}
+    raise HTTPException(status_code=404, detail="Request ID not found")
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "127.0.0.1")
+    uvicorn.run("app.main:app", host=host, port=port, reload=True)
+    

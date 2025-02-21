@@ -38,4 +38,4 @@ cloudinary
 supervisor
 pydantic>=2.0.0
 celery==5.4.0
-redis
+kombu

@@ -1,19 +1,20 @@
 import os
+import threading
+import requests
 from dotenv import load_dotenv
 from celery import Celery
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine
-from app.models import Product, Base
+from app.models import Product
 import cloudinary
 import cloudinary.uploader
-from cloudinary.utils import cloudinary_url
-from redis import Redis, ConnectionPool
-import requests
+from kombu import pools
 
 load_dotenv()
 
-REDIS_URL = os.getenv("REDIS_URL")
+CLOUDAMQP_API_URL = os.getenv("RABBITMQ_URL", "pyamqp://guest@localhost//")  
 
+# Cloudinary Config
 cloudinary.config(
     cloud_name=os.getenv("CLOUD_NAME"),
     api_key=os.getenv("API_KEY"),
@@ -21,38 +22,62 @@ cloudinary.config(
     secure=True,
 )
 
+# Database Setup
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set")
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-redis_pool = ConnectionPool.from_url(REDIS_URL, max_connections=10, decode_responses=True)
-redis_client = Redis(connection_pool=redis_pool)
+# Initialize Celery with RabbitMQ
+celery_app = Celery(
+    "tasks",
+    broker=CLOUDAMQP_API_URL,
+    backend="rpc://",
+    broker_transport_options={
+        "visibility_timeout": 3600,  
+        "heartbeat": 30,  
+        "confirm_publish": True, 
+        "tcp_user_timeout": 10000,
+        "socket_timeout": 5,  
+    },
+)
 
-celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+# Enable connection pooling
+pools.set_limit(10) 
 
-# Function to check Redis connection before processing
-def check_redis_connection():
+def cleanup_old_connections():
+    """Close old RabbitMQ connections if more than 20 exist using CloudAMQP API"""
     try:
-        if not redis_client.ping():
-            raise ConnectionError("Redis connection failed")
+        if not CLOUDAMQP_API_URL:
+            print("CLOUDAMQP_API_URL is not set, skipping cleanup")
+            return
+
+        response = requests.get(CLOUDAMQP_API_URL + "/connections", auth=(os.getenv("CLOUDAMQP_USER"), os.getenv("CLOUDAMQP_PASS")))
+        response.raise_for_status()
+        connections = response.json()
+
+        if len(connections) > 20:
+            old_connections = sorted(connections, key=lambda c: c['connected_at'])
+            for conn in old_connections[:-20]:
+                requests.delete(CLOUDAMQP_API_URL + f"/connections/{conn['name']}", auth=(os.getenv("CLOUDAMQP_USER"), os.getenv("CLOUDAMQP_PASS")))
+            print("Closed excess RabbitMQ connections")
     except Exception as e:
-        raise ConnectionError(f"Redis connection error: {e}")
+        print(f"Error cleaning up RabbitMQ connections: {e}")
+
+# Run cleanup every 5 minutes
+def schedule_cleanup():
+    cleanup_old_connections()
+    threading.Timer(300, schedule_cleanup).start()
+
+schedule_cleanup()
 
 @celery_app.task(bind=True, max_retries=3)
 def process_images(self, request_id, webhook_url):
     """Process images and update the database"""
-    
-    # Ensure Redis connection is alive
-    check_redis_connection()
-    
     db = SessionLocal()
     try:
-        # Cache task status in Redis
-        cache_key = f"task_status:{request_id}"
-        redis_client.set(cache_key, "processing", ex=600)
-
         result = []
         products = db.query(Product).filter(Product.request_id == request_id).all()
         for product in products:
@@ -82,7 +107,6 @@ def process_images(self, request_id, webhook_url):
         }
         response = requests.post(webhook_url, json=webhook_payload)
         print(f"Webhook response: {response.status_code}, {response.text}")
-
     except Exception as e:
         db.rollback()
         print(f"Error processing images: {e}")

@@ -25,7 +25,7 @@ SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
 if not SQLALCHEMY_DATABASE_URL:
     raise ValueError("DATABASE_URL is not set")
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_size=10, max_overflow=0)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base.metadata.create_all(bind=engine)

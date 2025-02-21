@@ -57,7 +57,9 @@ async def upload_csv(background_tasks: BackgroundTasks, file: UploadFile = File(
                 raise HTTPException(status_code=400, detail="Invalid CSV format")
         db.commit()
         
-        process_images.delay(request_id, webhook_url)
+        task = process_images.delay(request_id, webhook_url)
+        print("Task queued:", task.id)
+        
         return {"request_id": request_id}
     
     except Exception as e:

@@ -47,32 +47,6 @@ celery_app = Celery(
 # Enable connection pooling
 pools.set_limit(10) 
 
-def cleanup_old_connections():
-    """Close old RabbitMQ connections if more than 20 exist using CloudAMQP API"""
-    try:
-        if not CLOUDAMQP_API_URL:
-            print("CLOUDAMQP_API_URL is not set, skipping cleanup")
-            return
-
-        response = requests.get(CLOUDAMQP_API_URL + "/connections", auth=(os.getenv("CLOUDAMQP_USER"), os.getenv("CLOUDAMQP_PASS")))
-        response.raise_for_status()
-        connections = response.json()
-
-        if len(connections) > 20:
-            old_connections = sorted(connections, key=lambda c: c['connected_at'])
-            for conn in old_connections[:-20]:
-                requests.delete(CLOUDAMQP_API_URL + f"/connections/{conn['name']}", auth=(os.getenv("CLOUDAMQP_USER"), os.getenv("CLOUDAMQP_PASS")))
-            print("Closed excess RabbitMQ connections")
-    except Exception as e:
-        print(f"Error cleaning up RabbitMQ connections: {e}")
-
-# Run cleanup every 5 minutes
-def schedule_cleanup():
-    cleanup_old_connections()
-    threading.Timer(300, schedule_cleanup).start()
-
-schedule_cleanup()
-
 @celery_app.task(bind=True, max_retries=3)
 def process_images(self, request_id, webhook_url):
     """Process images and update the database"""
